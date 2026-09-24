@@ -1,0 +1,324 @@
+###############################################################################
+# TURBIDOSTAT GROWTH RATE ANALYSIS
+# Calculates microbial growth rates (μ) between dilution events
+# 
+# Requirements:
+#   - Excel/CSV file with columns: time_s (seconds), OD, pump_rate, reactor_type
+#   - Assumes pump_rate > 0 indicates active dilution
+#   - Requires: dplyr, ggplot2, purrr, readr, tibble
+###############################################################################
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(readr)
+library(tibble)
+
+# =============================================================================
+# 1. LOAD AND PREPARE DATA
+# =============================================================================
+
+# Load data - CHANGE THIS TO YOUR FILENAME
+df <- read_csv("m6_m7_claude.csv")
+
+# Extract relevant columns - note that column names have spaces
+# Using backticks to handle spaces in column names
+df <- df %>%
+  transmute(
+    time_s   = `time (s)`,      # Column A: time in seconds
+    od       = OD,              # Column B: optical density
+    pump     = `pump 1`,        # Column C: pump rate
+    reactor  = reactor          # Column D: reactor type (A or B)
+  ) %>%
+  arrange(time_s) %>%
+  # Remove any rows with missing OD or time values
+  filter(!is.na(time_s), !is.na(od))
+
+cat("Data loaded: ", nrow(df), " observations\n")
+cat("Reactors present: ", paste(unique(df$reactor), collapse = ", "), "\n")
+
+# =============================================================================
+# 2. DETECT DILUTION EVENTS
+# =============================================================================
+
+# Mark pump-on periods and create event IDs
+df <- df %>%
+  mutate(
+    pump_on     = pump > 0,
+    pump_on_lag = lag(pump_on, default = FALSE),
+    # event_id increments each time pump transitions from OFF → ON
+    event_id    = cumsum(pump_on & !pump_on_lag)
+  )
+
+# Summarize pump events: when did each dilution event start and end?
+pump_events <- df %>%
+  filter(pump_on) %>%
+  group_by(event_id) %>%
+  summarise(
+    t_on_start = min(time_s),
+    t_on_end   = max(time_s),
+    .groups    = "drop"
+  )
+
+cat("\nDilution events detected: ", nrow(pump_events), "\n")
+
+# =============================================================================
+# 3. DEFINE GROWTH INTERVALS (between dilution events)
+# =============================================================================
+
+# Growth intervals are periods when pump is OFF
+# We define intervals as: (end of dilution i) to (start of dilution i+1)
+
+if (nrow(pump_events) > 0) {
+  
+  # Intervals between consecutive pump events
+  base_intervals <- pump_events %>%
+    mutate(next_t_on_start = lead(t_on_start)) %>%
+    filter(!is.na(next_t_on_start)) %>%
+    transmute(
+      t_start = t_on_end,
+      t_end   = next_t_on_start
+    )
+  
+  # First interval: from start of experiment to first pump ON
+  first_t <- min(df$time_s, na.rm = TRUE)
+  first_t_on_start <- min(pump_events$t_on_start, na.rm = TRUE)
+  
+  growth_intervals <- dplyr::bind_rows(
+    tibble(
+      t_start = first_t,
+      t_end   = first_t_on_start
+    ),
+    base_intervals
+  ) %>%
+    mutate(interval_id = row_number())
+  
+  cat("Growth intervals defined: ", nrow(growth_intervals), "\n\n")
+  
+} else {
+  # No pump events → no growth intervals detected
+  cat("WARNING: No pump events detected. Treating entire dataset as one growth interval.\n\n")
+  growth_intervals <- tibble(
+    interval_id = 1,
+    t_start     = min(df$time_s),
+    t_end       = max(df$time_s)
+  )
+}
+
+# =============================================================================
+# 4. ASSIGN DATA POINTS TO GROWTH INTERVALS
+# =============================================================================
+
+# Helper function: assign each timepoint to an interval
+assign_interval <- function(t, starts, ends, ids) {
+  idx <- which(t >= starts & t <= ends)
+  if (length(idx) == 0) return(NA_integer_)
+  ids[idx[1]]
+}
+
+# Assign each row to an interval
+df_growth <- df %>%
+  mutate(
+    interval_id = map_int(
+      time_s,
+      ~ assign_interval(.x,
+                        growth_intervals$t_start,
+                        growth_intervals$t_end,
+                        growth_intervals$interval_id)
+    )
+  ) %>%
+  # Keep only non-pump timepoints with valid OD > 0
+  filter(!pump_on, !is.na(interval_id), od > 0) %>%
+  group_by(interval_id) %>%
+  mutate(
+    # Convert to hours relative to start of interval
+    time_h = (time_s - min(time_s)) / 3600
+  ) %>%
+  ungroup()
+
+cat("Data points for growth fitting: ", nrow(df_growth), "\n")
+cat("Data points removed (pump ON or OD ≤ 0): ", nrow(df) - nrow(df_growth), "\n\n")
+
+# =============================================================================
+# 5. FIT EXPONENTIAL GROWTH MODEL FOR EACH INTERVAL
+# =============================================================================
+# Model: log(OD) = log(OD_0) + μ*t
+# Where: μ = specific growth rate (per hour)
+#        OD_0 = initial optical density
+#
+# Fit via linear regression: ln(OD) ~ time
+# Extract slope = growth rate (μ)
+
+growth_fits <- df_growth %>%
+  group_by(interval_id) %>%
+  group_modify(~ {
+    dat <- .x
+    n_points <- nrow(dat)
+    
+    # Require minimum 5 data points for reliable fit
+    if (n_points < 5) {
+      return(tibble(
+        mu = NA_real_,
+        r2 = NA_real_,
+        rmse = NA_real_,
+        n_points = n_points,
+        status = "Insufficient data"
+      ))
+    }
+    
+    tryCatch({
+      # Fit linear model: log(OD) ~ time_h
+      fit <- lm(log(od) ~ time_h, data = dat)
+      
+      # Extract coefficients and statistics
+      mu <- coef(fit)[["time_h"]]
+      r2 <- summary(fit)$r.squared
+      rmse <- sqrt(mean(residuals(fit)^2))
+      
+      tibble(
+        mu = mu,
+        r2 = r2,
+        rmse = rmse,
+        n_points = n_points,
+        status = "Fitted"
+      )
+    }, error = function(e) {
+      tibble(
+        mu = NA_real_,
+        r2 = NA_real_,
+        rmse = NA_real_,
+        n_points = n_points,
+        status = paste("Error:", e$message)
+      )
+    })
+  }) %>%
+  ungroup()
+
+# Join back with interval metadata
+growth_fits <- growth_fits %>%
+  left_join(growth_intervals, by = "interval_id") %>%
+  mutate(
+    # Convert times to hours
+    t_start_h = t_start / 3600,
+    t_end_h   = t_end / 3600,
+    duration_h = t_end_h - t_start_h,
+    
+    # Calculate doubling time
+    doubling_time_h = ifelse(!is.na(mu) & mu > 0, 
+                             log(2) / mu, 
+                             NA_real_)
+  ) %>%
+  # Filter: keep only successful fits with >= 5 data points
+  filter(n_points >= 5, !is.na(mu))
+
+# =============================================================================
+# 6. ADD REACTOR INFORMATION (optional)
+# =============================================================================
+
+# If you want to know which reactor each interval came from
+# NOTE: Some intervals may contain data from both reactors
+# Group by interval_id AND reactor to avoid join conflicts
+df_interval_reactor <- df_growth %>%
+  group_by(interval_id, reactor) %>%
+  summarise(n_points_reactor = n(), .groups = "drop") %>%
+  # Keep the reactor with the most data points for each interval
+  arrange(interval_id, desc(n_points_reactor)) %>%
+  distinct(interval_id, .keep_all = TRUE) %>%
+  select(interval_id, reactor)
+
+growth_fits <- growth_fits %>%
+  left_join(df_interval_reactor, by = "interval_id")
+
+# =============================================================================
+# 7. RESULTS SUMMARY
+# =============================================================================
+
+cat("═════════════════════════════════════════════════════════════\n")
+cat("GROWTH RATE ANALYSIS RESULTS\n")
+cat("═════════════════════════════════════════════════════════════\n\n")
+
+cat("Summary Statistics (across all intervals):\n")
+cat("  Growth rate (μ) range:", 
+    round(min(growth_fits$mu, na.rm = TRUE), 4), "to", 
+    round(max(growth_fits$mu, na.rm = TRUE), 4), "per hour\n")
+cat("  Mean μ:", round(mean(growth_fits$mu), 4), "per hour\n")
+cat("  Mean doubling time:", round(mean(growth_fits$doubling_time_h, na.rm = TRUE), 2), "hours\n")
+cat("  Mean R² (model fit quality):", round(mean(growth_fits$r2), 4), "\n\n")
+
+# Display full results table
+print(growth_fits %>%
+        select(interval_id, reactor, mu, doubling_time_h, r2, n_points, 
+               t_start_h, t_end_h, duration_h) %>%
+        arrange(interval_id))
+
+# =============================================================================
+# 8. VISUALIZATION
+# =============================================================================
+
+# Plot 1: Growth curve with fits overlaid
+# Filter out any OD <= 0 to avoid log issues
+df_growth_plot <- df_growth %>% filter(od > 0)
+
+p1 <- ggplot(df_growth_plot, aes(x = time_h, y = od, color = as.factor(interval_id))) +
+  geom_point(size = 2, alpha = 0.6) +
+  # Add exponential fit lines (fit on log scale)
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, alpha = 0.2) +
+  facet_wrap(~ interval_id, scales = "free") +
+  scale_y_log10("Optical Density (log scale)") +
+  scale_x_continuous("Time within interval (hours)") +
+  scale_color_viridis_d("Interval") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  ggtitle("Growth Curves by Interval")
+
+# Plot 2: Growth rate comparison
+p2 <- ggplot(growth_fits, aes(x = as.factor(interval_id), y = mu, 
+                              fill = as.factor(reactor))) +
+  geom_col(position = "dodge", alpha = 0.7) +
+  scale_y_continuous("Growth Rate μ (per hour)") +
+  scale_x_discrete("Growth Interval") +
+  scale_fill_discrete("Reactor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Specific Growth Rate by Interval")
+
+# Plot 3: Growth rate vs model quality
+p3 <- ggplot(growth_fits, aes(x = r2, y = mu, color = as.factor(reactor), 
+                              size = n_points)) +
+  geom_point(alpha = 0.6) +
+  scale_x_continuous("Model R²") +
+  scale_y_continuous("Growth Rate μ (per hour)") +
+  scale_color_discrete("Reactor") +
+  scale_size_continuous("N data points") +
+  theme_minimal() +
+  ggtitle("Growth Rate vs Model Quality")
+
+# Plot 4: Timeline of growth rates
+p4 <- ggplot(growth_fits, aes(x = t_start_h, y = mu, color = as.factor(reactor))) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_line(alpha = 0.3) +
+  scale_x_continuous("Time (hours)") +
+  scale_y_continuous("Growth Rate μ (per hour)") +
+  scale_color_discrete("Reactor") +
+  theme_minimal() +
+  ggtitle("Growth Rate Temporal Dynamics")
+
+# Save plots
+ggsave("01_growth_curves.png", p1, width = 12, height = 8, dpi = 300)
+ggsave("02_growth_rates.png", p2, width = 8, height = 6, dpi = 300)
+ggsave("03_quality_vs_rate.png", p3, width = 8, height = 6, dpi = 300)
+ggsave("04_temporal_dynamics.png", p4, width = 10, height = 6, dpi = 300)
+
+cat("\n✓ Plots saved: 01_growth_curves.png through 04_temporal_dynamics.png\n")
+
+# =============================================================================
+# 9. EXPORT RESULTS
+# =============================================================================
+
+# Save detailed results to CSV
+write_csv(growth_fits, "growth_rates_results.csv")
+cat("✓ Results exported to: growth_rates_results.csv\n\n")
+
+# Save growth data used for fitting (optional, for validation)
+write_csv(df_growth, "growth_data_for_fitting.csv")
+cat("✓ Fitting data exported to: growth_data_for_fitting.csv\n")
