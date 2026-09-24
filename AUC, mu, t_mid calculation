@@ -1,0 +1,181 @@
+# ==========================================
+# Growthcurver AUC for 8 strains -> Excel-ready table
+# ==========================================
+
+# Install packages if needed
+pkgs <- c("readxl", "growthcurver", "dplyr", "tidyr", "pracma", "writexl")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(readxl)
+library(growthcurver)
+library(dplyr)
+library(tidyr)
+library(pracma)
+library(writexl)
+
+# ---- USER SETTINGS ----
+excel_path <- file.choose()    # pick your input Excel file
+sheet_name <- 1                # can be 1 or "Sheet1"
+time_col_name <- NULL          # NULL = use first column as time, or set e.g. "Time"
+n_grid <- 2000                 # resolution for fitted curve AUC + predictions
+# -----------------------
+
+# Read data
+df <- read_excel(excel_path, sheet = sheet_name) |> as.data.frame()
+
+# Time column
+time_col <- if (!is.null(time_col_name)) time_col_name else names(df)[1]
+df[[time_col]] <- as.numeric(df[[time_col]])
+
+# Strain columns
+strain_cols <- setdiff(names(df), time_col)
+
+# Keep relevant columns + coerce strains numeric
+df <- df[, c(time_col, strain_cols)]
+for (cn in strain_cols) df[[cn]] <- as.numeric(df[[cn]])
+
+# Drop missing time rows and sort
+df <- df[!is.na(df[[time_col]]), ]
+df <- df[order(df[[time_col]]), ]
+
+t_obs <- df[[time_col]]
+t_min <- min(t_obs, na.rm = TRUE)
+t_max <- max(t_obs, na.rm = TRUE)
+
+# Logistic function (growthcurver doesn't export logistic() anymore)
+logistic_fun <- function(t, k, n0, r) {
+  k / (1 + ((k - n0) / n0) * exp(-r * t))
+}
+
+# Analyze one strain and return:
+# (1) summary row for Excel
+# (2) long "predicted curve" table for Excel plotting
+analyze_strain <- function(t, y, strain_name, n_grid = 2000) {
+  
+  ok <- !is.na(t) & !is.na(y)
+  t2 <- t[ok]
+  y2 <- y[ok]
+  
+  # Raw AUC from observed points (trapezoid)
+  auc_raw <- if (length(t2) >= 2) pracma::trapz(t2, y2) else NA_real_
+  
+  if (length(t2) < 4) {
+    summary_row <- data.frame(
+      strain = strain_name,
+      n_points = length(t2),
+      success = FALSE,
+      note = "Too few non-missing points to fit",
+      auc_time_start = min(t2, na.rm = TRUE),
+      auc_time_end = max(t2, na.rm = TRUE),
+      auc_fitted = NA_real_,
+      auc_raw_trapz = auc_raw,
+      k = NA_real_, n0 = NA_real_, r = NA_real_, t_mid = NA_real_
+    )
+    
+    preds <- data.frame(
+      time = numeric(0),
+      strain = character(0),
+      od_pred = numeric(0)
+    )
+    
+    return(list(summary = summary_row, preds = preds))
+  }
+  
+  fit <- tryCatch(
+    growthcurver::SummarizeGrowth(t2, y2),
+    error = function(e) e
+  )
+  
+  if (inherits(fit, "error")) {
+    summary_row <- data.frame(
+      strain = strain_name,
+      n_points = length(t2),
+      success = FALSE,
+      note = paste("Fit error:", fit$message),
+      auc_time_start = min(t2, na.rm = TRUE),
+      auc_time_end = max(t2, na.rm = TRUE),
+      auc_fitted = NA_real_,
+      auc_raw_trapz = auc_raw,
+      k = NA_real_, n0 = NA_real_, r = NA_real_, t_mid = NA_real_
+    )
+    
+    preds <- data.frame(
+      time = numeric(0),
+      strain = character(0),
+      od_pred = numeric(0)
+    )
+    
+    return(list(summary = summary_row, preds = preds))
+  }
+  
+  k <- fit$vals$k
+  n0 <- fit$vals$n0
+  r <- fit$vals$r
+  t_mid <- fit$vals$t_mid
+  
+  # Fitted curve predictions on grid + fitted AUC
+  t_grid <- seq(min(t2), max(t2), length.out = n_grid)
+  y_hat <- logistic_fun(t_grid, k = k, n0 = n0, r = r)
+  auc_fitted <- pracma::trapz(t_grid, y_hat)
+  
+  summary_row <- data.frame(
+    strain = strain_name,
+    n_points = length(t2),
+    success = TRUE,
+    note = "",
+    auc_time_start = min(t2, na.rm = TRUE),
+    auc_time_end = max(t2, na.rm = TRUE),
+    auc_fitted = auc_fitted,
+    auc_raw_trapz = auc_raw,
+    k = k, n0 = n0, r = r, t_mid = t_mid
+  )
+  
+  preds <- data.frame(
+    time = t_grid,
+    strain = strain_name,
+    od_pred = y_hat
+  )
+  
+  list(summary = summary_row, preds = preds)
+}
+
+# Run all strains
+out_list <- lapply(strain_cols, function(cn) {
+  analyze_strain(df[[time_col]], df[[cn]], cn, n_grid = n_grid)
+})
+
+summary_table <- bind_rows(lapply(out_list, `[[`, "summary")) |>
+  arrange(desc(auc_fitted))
+
+pred_table_long <- bind_rows(lapply(out_list, `[[`, "preds"))
+
+# Also make a "wide" predictions table (time + one column per strain) for easy Excel plotting
+pred_table_wide <- pred_table_long |>
+  tidyr::pivot_wider(names_from = strain, values_from = od_pred) |>
+  arrange(time)
+
+# Write Excel file with multiple sheets
+output_xlsx <- "growthcurver_auc_excel_ready.xlsx"
+writexl::write_xlsx(
+  list(
+    "AUC_summary" = summary_table,
+    "Fitted_curve_long" = pred_table_long,
+    "Fitted_curve_wide" = pred_table_wide
+  ),
+  path = output_xlsx
+)
+
+# Also write CSVs (optional, Excel can open these too)
+write.csv(summary_table, "AUC_summary.csv", row.names = FALSE)
+write.csv(pred_table_wide, "Fitted_curve_wide.csv", row.names = FALSE)
+
+cat("\nSaved files:\n",
+    "- growthcurver_auc_excel_ready.xlsx (3 sheets)\n",
+    "- AUC_summary.csv\n",
+    "- Fitted_curve_wide.csv\n\n")
+
+cat("Excel plotting tips:\n")
+cat("1) For a simple line plot per strain: open 'Fitted_curve_wide' sheet,\n")
+cat("   select the whole table, Insert -> Line chart.\n")
+cat("2) For AUC bar plot: open 'AUC_summary' sheet, plot 'strain' vs 'auc_fitted'.\n")
